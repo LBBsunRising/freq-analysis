@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -515,24 +515,30 @@ class AdjustPanel(QWidget):
 
 
 class FolderImportDialog(QDialog):
-    """打开文件夹时弹出：列出所有图片文件、可勾选/筛选/预览/限制数量。"""
+    """打开文件夹时弹出：缩略图画廊，可勾选/筛选/预览/限制数量。"""
 
     SUGGEST_LIMIT = 100
     WARN_LIMIT = 500
-    PREVIEW_H = 200
-    THUMB_CACHE_MAX = 32
+    GRID_W = 150
+    GRID_H = 150
+    ICON_SZ = 120
+    PREVIEW_H = 320
+    THUMB_BATCH = 16
 
     def __init__(self, folder: str, paths: list[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("导入文件夹图片")
-        self.resize(760, 620)
+        self.resize(1080, 760)
         self._paths = paths
-        self._thumb_cache: dict[str, QPixmap] = {}
+        self._loaded: set[str] = set()       # 已生成列表缩略图的路径
+        self._failed: set[str] = set()       # 无法读取的路径
+        self._preview_path: str | None = None
+        self._preview_pm: QPixmap | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
 
-        info = QLabel(f"文件夹：{folder}\n共找到 {len(paths)} 张图片（已按文件名排序）")
+        info = QLabel(f"文件夹：{folder}\n共找到 {len(paths)} 张图片（已按文件名排序，勾选要导入的项）")
         info.setStyleSheet("color:#9ad;")
         outer.addWidget(info)
 
@@ -544,24 +550,45 @@ class FolderImportDialog(QDialog):
         filt.addWidget(self.filt_edit, 1)
         outer.addLayout(filt)
 
+        splitter = QSplitter(Qt.Horizontal)
+        outer.addWidget(splitter, 1)
+
+        # 左：缩略图画廊
         self.list = QListWidget()
-        self.list.setAlternatingRowColors(True)
+        self.list.setViewMode(QListWidget.IconMode)
+        self.list.setResizeMode(QListWidget.Adjust)
+        self.list.setMovement(QListWidget.Static)
+        self.list.setIconSize(QSize(self.ICON_SZ, self.ICON_SZ))
+        self.list.setGridSize(QSize(self.GRID_W, self.GRID_H))
+        self.list.setUniformItemSizes(True)
+        self.list.setWordWrap(True)
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.itemSelectionChanged.connect(self._on_select)
         self.list.itemChanged.connect(self._on_item_changed)
+        self._placeholder = self._make_placeholder("…")
         for p in paths:
             it = QListWidgetItem(os.path.basename(p))
             it.setData(Qt.UserRole, p)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setIcon(self._placeholder)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             it.setCheckState(Qt.Checked)
             self.list.addItem(it)
-        outer.addWidget(self.list, 1)
+        self.list.viewport().installEventFilter(self)
+        splitter.addWidget(self.list)
 
-        self.preview = QLabel("选择文件以预览")
+        # 右：大预览
+        right = QWidget()
+        rlay = QVBoxLayout(right)
+        rlay.setContentsMargins(0, 0, 0, 0)
+        self.preview = QLabel("选择左侧图片以预览")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumHeight(self.PREVIEW_H)
         self.preview.setStyleSheet("background:#222; color:#888; border:1px solid #333;")
-        outer.addWidget(self.preview)
+        rlay.addWidget(self.preview)
+        rlay.addStretch(1)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
 
         row = QHBoxLayout()
         b_all = QPushButton("全选")
@@ -599,14 +626,110 @@ class FolderImportDialog(QDialog):
         btns.rejected.connect(self.reject)
         outer.addWidget(btns)
 
+        # 懒加载：滚动/调整大小后批量加载可见项的缩略图
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(80)
+        self._thumb_timer.timeout.connect(self._load_visible_thumbs)
+        sb = self.list.verticalScrollBar()
+        sb.valueChanged.connect(self._schedule_thumb_load)
+        sb.rangeChanged.connect(self._schedule_thumb_load)
+
         self._update_count()
         self._update_warning()
+        QTimer.singleShot(0, self._schedule_thumb_load)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.list.viewport() and ev.type() == QEvent.Resize:
+            self._schedule_thumb_load()
+        return super().eventFilter(obj, ev)
+
+    def _schedule_thumb_load(self, *_):
+        self._thumb_timer.start()
+
+    def _load_visible_thumbs(self):
+        vp_rect = self.list.viewport().rect()
+        if vp_rect.isEmpty():
+            return
+        loaded_now = 0
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.isHidden():
+                continue
+            path = it.data(Qt.UserRole)
+            if path in self._loaded or path in self._failed:
+                continue
+            rect = self.list.visualItemRect(it)
+            if not rect.isValid() or not rect.intersects(vp_rect):
+                continue
+            pm = self._make_list_thumb(path)
+            if pm is None:
+                self._failed.add(path)
+                it.setIcon(self._make_placeholder("×"))
+            else:
+                self._loaded.add(path)
+                it.setIcon(pm)
+                loaded_now += 1
+            if loaded_now >= self.THUMB_BATCH:
+                self._thumb_timer.start()  # 继续加载剩余可见项
+                return
+
+    def _make_placeholder(self, text: str) -> QPixmap:
+        pm = QPixmap(self.ICON_SZ, self.ICON_SZ)
+        pm.fill(QColor("#333"))
+        painter = QPainter(pm)
+        painter.setPen(QColor("#888"))
+        painter.drawText(pm.rect(), Qt.AlignCenter, text)
+        painter.end()
+        return pm
+
+    @staticmethod
+    def _read_reduced(path: str) -> np.ndarray | None:
+        # 用 imdecode 读取字节缓冲，避免 Windows 非 ASCII 路径下 cv2.imread 失败
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+        except OSError:
+            return None
+        if data.size == 0:
+            return None
+        img = cv2.imdecode(data, cv2.IMREAD_REDUCED_COLOR_8)
+        if img is None:
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return img
+
+    def _make_list_thumb(self, path: str) -> QPixmap | None:
+        img = self._read_reduced(path)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        scale = self.ICON_SZ / max(h, w)
+        th, tw = max(1, int(h * scale)), max(1, int(w * scale))
+        img = cv2.resize(img, (tw, th))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return QPixmap.fromImage(rgb_to_qimage(rgb))
+
+    def _make_preview(self, path: str) -> QPixmap | None:
+        if path == self._preview_path and self._preview_pm is not None:
+            return self._preview_pm
+        img = self._read_reduced(path)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        scale = self.PREVIEW_H / max(h, w)
+        if scale < 1.0:
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pm = QPixmap.fromImage(rgb_to_qimage(rgb))
+        self._preview_path = path
+        self._preview_pm = pm
+        return pm
 
     def _apply_filter(self, text: str):
         key = text.strip().lower()
         for i in range(self.list.count()):
             it = self.list.item(i)
             it.setHidden(bool(key) and key not in it.text().lower())
+        self._schedule_thumb_load()
 
     def _set_all(self, state):
         self.list.blockSignals(True)
@@ -658,33 +781,13 @@ class FolderImportDialog(QDialog):
     def _on_select(self):
         it = self.list.currentItem()
         if it is None:
-            self.preview.setText("选择文件以预览")
+            self.preview.setText("选择左侧图片以预览")
             return
-        pm = self._load_thumb(it.data(Qt.UserRole))
+        pm = self._make_preview(it.data(Qt.UserRole))
         if pm is None:
             self.preview.setText("无法预览")
         else:
             self.preview.setPixmap(pm)
-
-    def _load_thumb(self, path: str) -> QPixmap | None:
-        if path in self._thumb_cache:
-            return self._thumb_cache[path]
-        # 用 1/8 缩略图模式读取，降低预览内存与耗时；失败则回退到正常读取
-        img = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8)
-        if img is None:
-            img = cv2.imread(path)
-        if img is None:
-            return None
-        h, w = img.shape[:2]
-        scale = self.PREVIEW_H / max(h, w)
-        if scale < 1.0:
-            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        pm = QPixmap.fromImage(rgb_to_qimage(rgb))
-        if len(self._thumb_cache) > self.THUMB_CACHE_MAX:
-            self._thumb_cache.pop(next(iter(self._thumb_cache)))
-        self._thumb_cache[path] = pm
-        return pm
 
     def selected_paths(self) -> list[str]:
         return self._checked_paths()[: self.limit_spin.value()]
@@ -832,9 +935,18 @@ class MainWindow(QMainWindow):
         self._load_paths(paths)
 
     def open_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
-        if not d:
+        # 用 Qt 内置（非原生）对话框，并在选文件夹时显示图片文件，便于边浏览边看到内容
+        dlg = QFileDialog(self, "选择图片文件夹")
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setNameFilter("图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff)")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.ShowDirsOnly, False)
+        if not dlg.exec():
             return
+        files = dlg.selectedFiles()
+        if not files:
+            return
+        d = files[0]
         paths = [
             os.path.join(d, fn)
             for fn in sorted(os.listdir(d))
@@ -843,10 +955,10 @@ class MainWindow(QMainWindow):
         if not paths:
             QMessageBox.information(self, "提示", "该文件夹下未找到支持的图片。")
             return
-        dlg = FolderImportDialog(d, paths, self)
-        if dlg.exec() != QDialog.Accepted:
+        sel = FolderImportDialog(d, paths, self)
+        if sel.exec() != QDialog.Accepted:
             return
-        selected = dlg.selected_paths()
+        selected = sel.selected_paths()
         if not selected:
             return
         self._load_paths(selected)
